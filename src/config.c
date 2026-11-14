@@ -1,4 +1,5 @@
 // Programa que interpreta dsm.conf
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +12,7 @@
 
 #define LINE_MAX_LEN 256 // max len de cada linea del .conf
 
-// Codificación de las claves para identificarlas por k_id (sin contar nodes)
+// Codificacion de las claves para identificarlas por k_id (sin contar nodes)
 enum {
     K_PAGE_SIZE = 0, K_DEFAULT_NODE_MEMORY, K_BASE_ADDRESS, K_PORT_MIN, K_PORT_MAX,
     K_HB_INTERVAL, K_HB_TIMEOUT, K_REQUEST_TIMEOUT, K_REQUEST_RETRIES,
@@ -48,10 +49,11 @@ static char* trim(char* s) {
     return s;
 }
 
-// Convierte un número decimal o hexadecimal en formato char a uint64_t.
+// Convierte un numero decimal o hexadecimal en formato char a uint64_t.
 static int parse_u64(const char *s, uint64_t *out) {
     char *end;
     errno = 0;
+    if (*s == '-') return -1; // rechazar negativos, strtoull lo aceptaria como un numero enorme
     unsigned long long v = strtoull(s, &end, 0);
     if (errno || end == s || *end != '\0') return -1;
     *out = v;
@@ -124,7 +126,7 @@ static int parse_node(dsm_config_t *c, const char *path, int node_n,
             return -1;
         }
         if (strlen(host) >= DSM_HOST_MAX) {
-            fprintf(stderr, "%s:%d: host demasiado largo (máx. %d)\n", path, node_ln[i], DSM_HOST_MAX); return -1;
+            fprintf(stderr, "%s:%d: host demasiado largo (max. %d)\n", path, node_ln[i], DSM_HOST_MAX); return -1;
         }
         node_config_t* node = &c->nodes[i];
         node->node_id = (uint16_t)id;
@@ -140,18 +142,18 @@ static int validate(const dsm_config_t *c, const char *path) {
     long os_page = sysconf(_SC_PAGESIZE);
 
     // valida que sea potencia de 2 con las propiedas de numeros binarios
-    if ((c->page_size & (c->page_size - 1)) || c->page_size % os_page) {
-        fprintf(stderr, "%s: page_size=%u debe ser potencia de 2 y múltiplo de %ld\n",
+    if (c->page_size <= 0 || (c->page_size & (c->page_size - 1)) || c->page_size % os_page) {
+        fprintf(stderr, "%s: page_size=%u debe ser potencia de 2 y multiplo de %ld\n",
                 path, c->page_size, os_page);
         return -1;
     }
     if (c->default_node_memory % c->page_size) {
-        fprintf(stderr, "%s: default_node_memory no es múltiplo de page_size\n", path);
+        fprintf(stderr, "%s: default_node_memory no es multiplo de page_size\n", path);
         return -1;
     }
     // que no empiece a mitad de una pagina
     if (c->base_address % c->page_size) {
-        fprintf(stderr, "%s: base_address no es múltiplo de page_size\n", path);
+        fprintf(stderr, "%s: base_address no es multiplo de page_size\n", path);
         return -1;
     }
     if (c->port_min >= c->port_max) {
@@ -167,14 +169,33 @@ static int validate(const dsm_config_t *c, const char *path) {
         fprintf(stderr, "%s: max_payload debe ser >= page_size\n", path);
         return -1;
     }
+    // cada hilo registrado ocupa un bit de waiters_mask
+    if (c->max_threads <= 0 || c->max_threads > DSM_MAX_THREADS) {
+        fprintf(stderr, "%s: max_threads debe estar entre 1 y %d\n", path, DSM_MAX_THREADS);
+        return -1;
+    }
+    if (c->fault_threads <= 0) {
+        fprintf(stderr, "%s: fault_threads debe ser al menos 1\n", path);
+        return -1;
+    }
+    if (c->service_threads <= 0 || c->protocol_workers <= 0) {
+        fprintf(stderr, "%s: service_threads y protocol_workers deben ser al menos 1\n", path);
+        return -1;
+    }
+    if (c->max_pending <= 0 || c->request_timeout_ms <= 0 || c->hb_interval_ms <= 0) {
+        fprintf(stderr, "%s: max_pending, request_timeout_ms y heartbeat_interval_ms deben ser mayores que 0\n", path);
+        return -1;
+    }
 
+    // última direccion del espacio de usuario en x86_64
+    const uint64_t user_max = 0x7fffffffffffULL;
     uint64_t total = 0;
 
     // validaciones de nodos y puertos sin repetir
     for (int i = 0; i < c->node_count; i++) {
         const node_config_t *node = &c->nodes[i];
         if (node->memory_bytes == 0 || node->memory_bytes % c->page_size) {
-            fprintf(stderr, "%s: node %d: memoria no es múltiplo de page_size\n", path, i);
+            fprintf(stderr, "%s: node %d: memoria no es multiplo de page_size\n", path, i);
             return -1;
         }
         if (node->data_port < c->port_min || node->data_port > c->port_max ||
@@ -195,12 +216,22 @@ static int validate(const dsm_config_t *c, const char *path) {
                 return -1;
             }
         }
+        // se compara antes de sumar para que total no se desborde
+        if (node->memory_bytes > user_max - total) {
+            fprintf(stderr, "%s: node %d: la memoria total de los nodos no cabe en el espacio de usuario\n", path, i);
+            return -1;
+        }
         total += node->memory_bytes;
     }
 
     // que no exceda el rango maximo de direcciones disponibles para usuarios en x64_86
-    if (c->base_address + total > 0x7fffffffffffULL) {
+    if (c->base_address > user_max || c->base_address + total > user_max) {
         fprintf(stderr, "%s: base_address + memoria total aportada por los nodos sale del espacio de usuario\n", path);
+        return -1;
+    }
+        // no deben haber mas numeros de pagina de las que se pueden guardar
+    if (total / c->page_size > UINT32_MAX) {
+        fprintf(stderr, "%s: la memoria total supera %u paginas de page_size=%u\n", path, UINT32_MAX, c->page_size);
         return -1;
     }
     return 0;
@@ -216,18 +247,18 @@ int dsm_config_load(const char* path, dsm_config_t* c) {
 
     char line[LINE_MAX_LEN];
     int ln = 0, res = -1;
-    // Las líneas node se guardan por aparte; [][] matriz fxc
+    // Las lineas node se guardan por aparte; [][] matriz fxc
     char node_lines[DSM_MAX_NODES][LINE_MAX_LEN];
     int node_ln[DSM_MAX_NODES], node_n = 0; // numero de linea con la info; numero de nodos
 
-    char saved[NUM_KEYS] = {0};   // claves ya leídas, para detectar repetidas
+    char saved[NUM_KEYS] = {0};   // claves ya leidas, para detectar repetidas
 
     uint64_t hash = 14695981039346656037ULL; // constante fija del alg
 
     while (fgets(line, sizeof line, file) != NULL) {
         ln++;
         if (!strchr(line, '\n') && !feof(file)) {
-            fprintf(stderr, "%s:%d: línea demasiado larga\n", path, ln); goto out;
+            fprintf(stderr, "%s:%d: linea demasiado larga\n", path, ln); goto out;
         }
         // Cortar comentarios '#' y quitar espacios; si queda vacia, se ignora
         char* comment = strchr(line, '#');
@@ -247,7 +278,7 @@ int dsm_config_load(const char* path, dsm_config_t* c) {
         snprintf(norm, sizeof norm, "%s=%s", key, val);
         hash_line(&hash, norm);
 
-        // Guarda lso nodos leidos para evaluarlos al final
+        // Guarda los nodos leidos para evaluarlos al final
         if (strcmp(key, "node") == 0) {
             if (node_n >= DSM_MAX_NODES) { fprintf(stderr, "%s:%d: demasiados nodos\n", path, ln); goto out; }
             snprintf(node_lines[node_n], LINE_MAX_LEN, "%s", val); node_ln[node_n++] = ln;
@@ -263,13 +294,13 @@ int dsm_config_load(const char* path, dsm_config_t* c) {
             fprintf(stderr, "%s:%d: '%s' repetido\n", path, ln, key); goto out;
         }
         if (set_param(c, k_id, val)) {
-            fprintf(stderr, "%s:%d: valor inválido en %s='%s'\n", path, ln, key, val); goto out;
+            fprintf(stderr, "%s:%d: valor invalido en %s='%s'\n", path, ln, key, val); goto out;
         }
         saved[k_id] = 1;
     }
     if (ferror(file)) { fprintf(stderr, "%s: error de lectura\n", path); goto out; }
 
-    if (node_n == 0) { fprintf(stderr, "%s: no hay ninguna línea de nodos\n", path); goto out; }
+    if (node_n == 0) { fprintf(stderr, "%s: no hay ninguna linea de nodos\n", path); goto out; }
 
     // Nodos ya con default_node_memory definido; luego se valida todo
     if (parse_node(c, path, node_n, node_ln, node_lines)) goto out;
@@ -280,4 +311,28 @@ int dsm_config_load(const char* path, dsm_config_t* c) {
 out:
     fclose(file);
     return res;
+}
+
+// ----- registro de eventos -----
+
+static uint8_t  log_level = LOG_INFO;
+static uint16_t log_node  = UINT16_MAX;   // sin nodo todavía
+
+void dsm_log_setup(uint8_t level, uint16_t node) {
+    log_level = level;
+    log_node  = node;
+}
+
+void dsm_log(int level, const char* fmt, ...) {
+    static const char* names[] = { "error", "warn", "info", "debug" };
+    if (level > log_level) return;
+
+    char line[512];   // una sola escritura por mensaje, y no se mezclan los de varios hilos
+    int n = log_node == UINT16_MAX ? snprintf(line, sizeof line, "[dsm %s] ", names[level]) // max indica que habla el dsm (para todos)
+                                   : snprintf(line, sizeof line, "[nodo %u %s] ", log_node, names[level]);
+    va_list args;
+    va_start(args, fmt); //recorrer args despues de fmt
+    vsnprintf(line + n, sizeof line - (size_t)n, fmt, args);
+    va_end(args);
+    fprintf(stderr, "%s\n", line);
 }

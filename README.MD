@@ -120,6 +120,7 @@ Desde la raíz del repositorio (de momento se tiene):
 ``` bash
 make            # compila dsm_system
 make run        # compila y valida dsm.conf (make run CONF=otro.conf)
+make test       # corre las pruebas de la configuración, del paginador y del clúster (3 nodos locales)
 make asan       # recompila con AddressSanitizer
 make clean      # borra objetos y ejecutables
 ```
@@ -129,22 +130,44 @@ Los objetivos nuevos se documentarán aquí cuando existan en el `Makefile`.
 
 ## Ejecución
 
-Por ahora solo se puede validar la configuración:
+Para validar la configuración sin iniciar un nodo:
 
 ``` bash
 ./dsm_system dsm.conf
 ```
 
 Imprime los parámetros, los nodos y el rango de memoria global, o el error con su
-línea. Próximamente se implementará y documentará la ejecución que lleve a:
+línea.
 
-1.  Cómo iniciar un nodo.
-2.  Cómo incorporar nodos adicionales.
-3.  Cómo comprobar que los nodos se reconocen y están disponibles.
-4.  Cómo ejecutar las aplicaciones de validación.
-5.  Cómo consultar las tablas de páginas y las estadísticas locales y
-    globales.
-6.  Cómo detener el sistema de forma ordenada.
+Para iniciar un nodo se indica su `id` (el de su línea `node` en `dsm.conf`). Cada
+nodo es un proceso: uno por terminal en la misma máquina, o uno por computadora
+usando en `dsm.conf` la IP de cada equipo. Todos deben usar el mismo `dsm.conf`.
+
+``` bash
+./dsm_system dsm.conf 0     # terminal o computadora del nodo 0
+./dsm_system dsm.conf 1     # terminal o computadora del nodo 1
+```
+
+Los nodos pueden iniciarse en cualquier orden y se unen solos al clúster. La memoria
+disponible es la de los nodos que están en línea. Cada nodo ofrece una consola:
+
+| Orden | Qué hace |
+|---|---|
+| `nodes` | Tabla de nodos, su estado y la memoria disponible. |
+| `pages` | Páginas usadas: estado MSI local y, en su home, el directorio de copias. |
+| `read <página>` | Lee el texto guardado en la página. |
+| `write <página> <texto>` | Escribe un texto en la página. |
+| `incr <página> <n> <veces>` | Suma 1 `<veces>` veces al contador `n` de la página. |
+| `get <página> <n>` | Muestra el contador `n` de la página. |
+| `quit` | Sale del clúster de forma ordenada (igual que Ctrl+D o Ctrl+C). |
+
+Al salir de forma ordenada, el nodo devuelve a su home las páginas de otros nodos que
+tenía modificadas. Las páginas que aportaba el nodo que sale dejan de estar disponibles.
+
+Pendiente de implementar y documentar:
+
+1.  Cómo ejecutar las aplicaciones de validación.
+2.  Cómo consultar las estadísticas locales y globales.
 
 ## Aplicaciones de validación
 
