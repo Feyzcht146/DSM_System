@@ -1,8 +1,11 @@
+// Estructuras, constantes y tipos de mensaje internos del DSM. Las aplicaciones no incluyen
+// este archivo: sus tipos públicos están en include/dsm.h.
 #ifndef ESTRUCTURAS_H
 #define ESTRUCTURAS_H
 
 #include <pthread.h>
 #include <semaphore.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <time.h>
 
@@ -16,10 +19,16 @@
 #define DSM_WORK_PAYLOAD     96 // mayor carga fija de una solicitud (node_desc)
 #define DSM_NODE_DESC_LEN    96
 #define DSM_HB_PAYLOAD_LEN   16
+#define DSM_TAG_MAX          32 // etiqueta o nombre de una asignación, con su '\0'
+#define DSM_ALLOC_DESC_LEN   56 // carga de ALLOC_RESERVE y de la respuesta de NAME_LOOKUP
+#define DSM_ALLOC_RELEASE_LEN 12
+#define DSM_STATS_LEN        160 // respuesta de STATS_REQUEST
+#define DSM_PAGE_ENTRY_LEN   32 // una página en la respuesta de PAGETABLE_REQUEST
 
 enum { LOG_ERROR = 0, LOG_WARN, LOG_INFO, LOG_DEBUG };
 
-// Estado MSI de la copia local de una página; fija su permiso en la vista de aplicación
+// Estado MSI de la copia local de una página; fija su permiso en la vista de aplicación.
+// El orden importa: I < S < M (pager_downgrade compara con <).
 enum {
     PAGE_INVALID = 0,   // PROT_NONE
     PAGE_SHARED,        // PROT_READ
@@ -32,9 +41,12 @@ enum { ACCESS_UNKNOWN = 0, ACCESS_READ = 1, ACCESS_WRITE = 2 };
 enum { NODE_UNKNOWN = 0, NODE_ONLINE, NODE_OFFLINE };   // estado en la tabla de nodos
 enum { DIR_UNCACHED = 0, DIR_SHARED, DIR_MODIFIED };    // estado de una página en su home
 enum { ALLOC_FREE = 0, ALLOC_RESERVED, ALLOC_ALLOCATED, ALLOC_LOST };
+enum { ALLOC_NAMED = 1, ALLOC_ATTACHED = 2 };                // alloc_record_t.flags
 enum { REQ_SENT = 1, REQ_RECEIVING, REQ_ANSWERED };     // vida de una solicitud pendiente
 
-// Tipos de mensaje
+// Tipos de mensaje. Están agrupados (membresía, coherencia, asignación, consultas) y el
+// worker de network.c reparte según el grupo comparando con el primero de cada uno: un tipo
+// nuevo va al final de su grupo.
 enum {
     MSG_JOIN = 1,        // unión al clúster: lleva node_desc con el hash de la configuración
     MSG_JOIN_ACK,        // respuesta a JOIN
@@ -46,6 +58,13 @@ enum {
     MSG_OWNER_FETCH,     // home -> owner: devolver la página modificada
     MSG_INVALIDATE,      // home -> nodo con copia
     MSG_INVALIDATE_ACK,
+    MSG_ALLOC_MAP,       // pide a un home el mapa de bits de sus páginas libres
+    MSG_ALLOC_RESERVE,   // reserva un tramo de páginas del home: todas o ninguna
+    MSG_ALLOC_RELEASE,   // libera un tramo: invalida sus copias y lo deja en cero
+    MSG_NAME_LOOKUP,     // busca una asignación por nombre
+    MSG_STATS_REQUEST,   // consulta: proceso y contadores del nodo
+    MSG_PAGETABLE_REQUEST, // consulta: páginas en uso del nodo, desde header.page
+    MSG_ALLOCS_REQUEST,  // consulta: asignaciones con páginas en el nodo, desde header.aux
     MSG_TYPE_COUNT
 };
 
@@ -59,7 +78,8 @@ enum {
     ERR_TIMEOUT,           // no llegó la respuesta a tiempo
     ERR_BUSY,              // no hay espacio para otra solicitud
     ERR_PROTOCOL,          // mensaje inválido
-    ERR_NOT_OWNER          // se pidió la página a un nodo que no la tiene en M
+    ERR_NOT_OWNER,         // se pidió la página a un nodo que no la tiene en M
+    ERR_NOT_FOUND          // el nodo no conoce una asignación con ese nombre
 };
 
 // ----- configuración -----
@@ -112,9 +132,9 @@ typedef struct {                    // solicitud en espera en la cola de una pá
 typedef struct {                    // entrada del directorio; una por página que aporta el nodo
     pthread_mutex_t lock;
     uint64_t copyset;               // bit i = el nodo i tiene copia (S o M)
-    uint32_t alloc_id;              // identificar asignaciones (0 = libnre)
-    uint32_t alloc_order;
-    int32_t  alloc_pid;
+    uint32_t alloc_id;              // identificar asignaciones (0 = libre)
+    uint32_t alloc_order;           // posición de la página dentro de su asignación
+    int32_t  alloc_pid;             // proceso que la asignó
     uint32_t transac_req_id;        // transacción que espera PAGE_ACK (0 = ninguna)
     struct timespec transac_deadline;
     uint16_t owner;                 // nodo con la copia M; válido si dir_state = DIR_MODIFIED
@@ -128,10 +148,19 @@ typedef struct {                    // entrada del directorio; una por página q
     dir_waiter_t queue[DSM_MAX_NODES];   // FIFO; a lo sumo una solicitud por nodo
 } dir_entry_t;
 
-typedef struct {                    // hilo de aplicación registrado
-    int       reply_r, reply_w;     // pipe por el que el servicio de fallos lo despierta
-    pthread_t tid;
-    uint8_t   in_use;
+typedef struct {                    // una asignación de memoria (dsm_alloc)
+    uint32_t alloc_id;              // (nodo << 24) | contador del nodo que asignó
+    uint32_t first_page;            // primera página global de la asignación
+    uint32_t n_pages;               // páginas contiguas; pueden cruzar nodos
+    int32_t  pid;                   // proceso que la creó
+    uint16_t node;                  // nodo donde corre ese proceso
+    uint16_t flags;                 // ALLOC_NAMED, ALLOC_ATTACHED
+    char     tag[DSM_TAG_MAX];      // etiqueta o nombre
+} alloc_record_t;
+
+typedef struct {                    // lugar de un hilo de aplicación que usa el DSM
+    int reply_r, reply_w;           // pipe por el que el servicio de fallos lo despierta
+    _Atomic int32_t tid;            // hilo dueño del slot (id del kernel, gettid); 0 = libre
 } thread_slot_t;
 
 typedef struct {                    // aviso del manejador al servicio de fallos
@@ -140,6 +169,17 @@ typedef struct {                    // aviso del manejador al servicio de fallos
     uint16_t slot;                  // slot del hilo que falló
     uint64_t addr;                  // si_addr, para diagnóstico
 } fault_record_t;
+
+// ----- estadísticas -----
+
+typedef struct {                    // contadores del nodo; atómicos, sin lock
+    _Atomic uint64_t read_faults, write_faults;       // fallos de página atendidos
+    _Atomic uint64_t pages_sent, pages_received;      // páginas enviadas a / recibidas de otros nodos
+    _Atomic uint64_t inval_sent, inval_received;      // mensajes INVALIDATE
+    _Atomic uint64_t msgs_sent, msgs_received;
+    _Atomic uint64_t bytes_sent, bytes_received;
+    _Atomic uint64_t fault_ns_total, fault_ns_max;    // latencia de resolución de fallos
+} dsm_counters_t;
 
 // ----- red -----
 
@@ -154,8 +194,8 @@ typedef struct {                    // cabecera de un mensaje (en la red va camp
     uint16_t status;                // ST_OK o ERR_*
     uint8_t  state;                 // estado MSI concedido
     uint8_t  access;
-    uint32_t payload_len;
-    uint32_t aux;
+    uint32_t payload_len;           // bytes de carga que siguen a la cabecera
+    uint32_t aux;                   // argumento extra según el tipo (p. ej. dónde seguir una consulta)
 } msg_header_t;
 
 typedef struct {                    // un nodo del clúster

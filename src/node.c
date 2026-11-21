@@ -10,6 +10,7 @@
 #include "network.h"
 #include "node.h"
 #include "pager.h"
+#include "stats.h"
 
 static dsm_config_t cfg;
 static uint16_t self;
@@ -24,6 +25,7 @@ static int hb_started;
 static atomic_int stopping;
 static struct timespec started;     // para el uptime que viaja en el heartbeat
 
+// Milisegundos transcurridos desde t (reloj monotónico)
 static uint64_t ms_since(const struct timespec *t) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -31,10 +33,12 @@ static uint64_t ms_since(const struct timespec *t) {
     return ms > 0 ? (uint64_t)ms : 0;
 }
 
+// Espera máxima de un connect: request_timeout_ms, con tope de 1 s
 static int connect_timeout(void) {
     return cfg.request_timeout_ms < 1000 ? (int)cfg.request_timeout_ms : 1000;
 }
 
+// Completa los campos fijos del encabezado: protocolo, versión, origen y destino
 static void stamp(msg_header_t *h, uint16_t dst) {
     h->dsm_id = DSM_PROTOCOL_ID;
     h->version = DSM_PROTOCOL_VERSION;
@@ -56,6 +60,7 @@ static void fill_node_desc(uint8_t *b) {
     memcpy(b + 32, me->host, DSM_HOST_MAX);
 }
 
+// Cierra los sockets de salida hacia el nodo
 static void close_out_sockets(node_info_t *n) {
     pthread_mutex_lock(&n->send_lock);
     if (n->data_out_fd >= 0) close(n->data_out_fd);
@@ -65,6 +70,10 @@ static void close_out_sockets(node_info_t *n) {
 }
 
 /* ----- consultas ----- */
+
+uint64_t node_uptime_ms(void) {
+    return ms_since(&started);
+}
 
 uint16_t node_self(void) {
     return self;
@@ -78,6 +87,7 @@ int node_is_online(uint16_t id) {
     return online;
 }
 
+// Copia la entrada del nodo bajo el lock de la tabla
 int node_info(uint16_t id, node_info_t *out) {
     if (id >= cfg.node_count) return -1;
     const node_info_t *n = &nodes[id];
@@ -85,7 +95,7 @@ int node_info(uint16_t id, node_info_t *out) {
     out->last_seen   = n->last_seen;
     out->first_page  = n->first_page;
     out->n_pages     = n->n_pages;
-    out->free_pages  = n->free_pages;
+    out->free_pages  = id == self ? coherence_free_pages() : n->free_pages;   // las demás, del último latido
     out->node_id     = n->node_id;
     out->status      = n->status;
     out->missed_hb   = n->missed_hb;
@@ -94,6 +104,7 @@ int node_info(uint16_t id, node_info_t *out) {
     return 0;
 }
 
+// Memoria total que aportan los nodos en línea; en *online deja cuántos son
 uint64_t node_online_memory(uint16_t *online) {
     uint64_t bytes = 0;
     uint16_t count = 0;
@@ -117,6 +128,7 @@ static void log_membership(int level, uint16_t id, const char *what, const char 
 
 /* ----- recepción ----- */
 
+// Llegó un mensaje del nodo: está vivo, reinicia su conteo de latidos perdidos
 void node_seen(uint16_t id) {
     pthread_rwlock_wrlock(&table_lock);
     clock_gettime(CLOCK_MONOTONIC, &nodes[id].last_seen);
@@ -124,6 +136,7 @@ void node_seen(uint16_t id) {
     pthread_rwlock_unlock(&table_lock);
 }
 
+// Guarda las páginas libres que informó el nodo en su latido
 void node_heartbeat(uint16_t id, uint32_t free_pages) {
     pthread_rwlock_wrlock(&table_lock);
     nodes[id].free_pages = free_pages;
@@ -132,6 +145,8 @@ void node_heartbeat(uint16_t id, uint32_t free_pages) {
 
 /* ----- envío ----- */
 
+// Envía un mensaje a dst sin esperar respuesta (para esperar, net_request). Si dst es este
+// mismo nodo, lo entrega directo a la cola, sin socket. Si el envío falla, da al nodo por caído.
 int node_send(uint16_t dst, const msg_header_t *h, const void *payload) {
     msg_header_t out = *h;
     stamp(&out, dst);
@@ -146,7 +161,10 @@ int node_send(uint16_t dst, const msg_header_t *h, const void *payload) {
     if (!joining && !node_is_online(dst)) return -1;
 
     node_info_t *n = &nodes[dst];
-    pthread_mutex_lock(&n->send_lock);   // un mensaje a la vez por socket: no se mezclan
+    // Un mensaje a la vez por socket: si dos hilos escribieran juntos, los bytes de sus
+    // mensajes se intercalarían y el receptor no podría separarlos
+    pthread_mutex_lock(&n->send_lock);
+    // Los latidos van por su propio socket: un envío grande de páginas no los retrasa
     int fd = h->type == MSG_HEARTBEAT ? n->hb_out_fd : n->data_out_fd;
     int rc = fd < 0 ? -1 : net_send_fd(fd, &out, payload);
     pthread_mutex_unlock(&n->send_lock);
@@ -157,7 +175,8 @@ int node_send(uint16_t dst, const msg_header_t *h, const void *payload) {
 
 /* ----- cambios de estado ----- */
 
-// Abre los sockets de salida que falten y marca el nodo en línea. 0 o -1.
+// Abre los sockets de salida que falten y marca el nodo en línea. Devuelve 0, o -1 si no
+// logró conectar.
 static int set_online(uint16_t id) {
     node_info_t *n = &nodes[id];
     const node_config_t *nc = &cfg.nodes[id];
@@ -180,10 +199,16 @@ static int set_online(uint16_t id) {
     n->free_pages = n->n_pages;
     clock_gettime(CLOCK_MONOTONIC, &n->last_seen);
     pthread_rwlock_unlock(&table_lock);
-    if (!was_online) log_membership(LOG_INFO, id, "en línea", nc->host);
+    if (!was_online) {
+        dsm_log(LOG_DEBUG, "conexiones abiertas con el nodo %u: datos %s:%u y heartbeat %s:%u",
+                id, nc->host, nc->data_port, nc->host, nc->hb_port);
+        log_membership(LOG_INFO, id, "en línea", nc->host);
+    }
     return 0;
 }
 
+// Marca al nodo fuera de línea y limpia todo lo que dependía de él. Puede llamarse varias
+// veces por la misma caída (listener, envío fallido, heartbeat): solo la primera actúa.
 void node_down(uint16_t id, const char *reason) {
     if (id >= cfg.node_count || id == self) return;
     node_info_t *n = &nodes[id];
@@ -198,12 +223,14 @@ void node_down(uint16_t id, const char *reason) {
     net_fail_pending(id);        // quienes esperaban su respuesta terminan con ERR_NODE_DOWN
     if (stopping) return;        // este nodo está saliendo: su directorio ya no importa
     coherence_node_down(id);     // sale de las copias; sus páginas dejan de estar disponibles
+    net_push_release(id);        // un worker libera lo que habían asignado sus procesos
     log_membership(LOG_INFO, id, "fuera de línea", reason);
 }
 
 /* ----- unión y salida ----- */
 
-// Intenta unirse al nodo id. 0 = en línea, 1 = no disponible, -1 = rechazó la unión.
+// Intenta unirse al nodo id: conecta, envía JOIN con la descripción de este nodo y espera el
+// JOIN_ACK. Devuelve 0 = en línea, 1 = no disponible (se reintenta luego), -1 = rechazó la unión.
 static int try_join(uint16_t id) {
     node_info_t *n = &nodes[id];
     if (node_is_online(id)) return 0;
@@ -229,6 +256,7 @@ static int try_join(uint16_t id) {
     return 1;
 }
 
+// JOIN recibido: acepta al nodo si usa el mismo dsm.conf y le responde JOIN_ACK
 static void handle_join(const work_item_t *item) {
     uint16_t id = item->from_node;
     uint8_t desc[DSM_NODE_DESC_LEN];
@@ -236,7 +264,8 @@ static void handle_join(const work_item_t *item) {
     msg_header_t reply = { .type = MSG_JOIN_ACK, .flags = FLAG_IS_REPLY,
                            .req_id = item->header.req_id, .payload_len = sizeof desc };
 
-    // Todos los nodos deben usar el mismo dsm.conf: se compara su hash
+    // Todos los nodos deben usar el mismo dsm.conf: si no, cada uno armaría un espacio global
+    // distinto. Se compara el hash de la configuración que viaja en la descripción.
     int same = item->header.payload_len == DSM_NODE_DESC_LEN &&
                net_get16(item->payload) == id &&
                net_get64(item->payload + 16) == cfg.config_hash;
@@ -255,14 +284,18 @@ static void handle_join(const work_item_t *item) {
     if (set_online(id) == 0) node_send(id, &reply, desc);
 }
 
+// LEAVE recibido: el nodo sale de forma ordenada. Antes de responder recupera sus páginas en
+// M, así el que sale no termina hasta que sus datos están a salvo en los homes.
 static void handle_leave(const work_item_t *item) {
     uint16_t id = item->from_node;
     coherence_recover_from(id);   // antes de que se vaya: devuelve lo que modificó
+    stats_remember(id);           // y deja sus métricas finales para las consultas
     msg_header_t reply = { .type = MSG_LEAVE, .flags = FLAG_IS_REPLY, .req_id = item->header.req_id };
     node_send(id, &reply, NULL);
     node_down(id, "salida ordenada");
 }
 
+// Entrada de los mensajes de membresía (JOIN, LEAVE y la orden local de unirse)
 void node_handle(const work_item_t *item) {
     if (item->header.type == MSG_LEAVE) {
         handle_leave(item);
@@ -275,13 +308,17 @@ void node_handle(const work_item_t *item) {
 
 /* ----- heartbeat ----- */
 
+// Hilo de heartbeat. Cada hb_interval_ms: envía un latido a cada nodo en línea, da por caído
+// al que lleva más de hb_timeout_ms sin mandar nada, revisa transacciones vencidas y reintenta
+// unirse a un nodo que no esté en línea.
 static void *heartbeat(void *arg) {
     (void)arg;
     uint16_t retry = 0;
     while (!stopping) {
         uint8_t hb[DSM_HB_PAYLOAD_LEN];
-        net_put32(hb, nodes[self].n_pages);   // páginas libres: todas, mientras no haya asignador
-        net_put32(hb + 4, 0);
+        uint32_t free_pages = coherence_free_pages();
+        net_put32(hb, free_pages);
+        net_put32(hb + 4, nodes[self].n_pages - free_pages);
         net_put64(hb + 8, ms_since(&started));
 
         for (uint16_t id = 0; id < cfg.node_count; id++) {
@@ -295,6 +332,8 @@ static void *heartbeat(void *arg) {
 
             // Cualquier mensaje cuenta como señal de vida, no solo los latidos
             if (silent > cfg.hb_timeout_ms) {
+                dsm_log(LOG_WARN, "nodo %u: %lu ms sin recibir mensajes (límite %u ms)",
+                        id, (unsigned long)silent, cfg.hb_timeout_ms);
                 node_down(id, "sin mensajes durante heartbeat_timeout_ms");
                 continue;
             }
@@ -303,7 +342,8 @@ static void *heartbeat(void *arg) {
         }
         coherence_tick();
 
-        // Reintenta la unión con un nodo que no esté en línea por vuelta
+        // Reintenta la unión con un solo nodo por vuelta, rotando. La unión la hace un worker
+        // (net_push_join): si la hiciera este hilo, un connect lento atrasaría los latidos.
         for (uint16_t k = 0; k < cfg.node_count; k++) {
             retry = (uint16_t)((retry + 1) % cfg.node_count);
             if (retry == self || node_is_online(retry)) continue;
@@ -317,6 +357,8 @@ static void *heartbeat(void *arg) {
     return NULL;
 }
 
+// Se une a los nodos que respondan y arranca el heartbeat. Los que no respondan se reintentan
+// después. Falla solo si algún nodo rechazó la unión por tener otro dsm.conf.
 int node_join_cluster(void) {
     clock_gettime(CLOCK_MONOTONIC, &started);
     int rejected = 0;
@@ -333,6 +375,8 @@ int node_join_cluster(void) {
     return 0;
 }
 
+// Salida ordenada: detiene el heartbeat y envía LEAVE a cada nodo en línea, esperando que
+// cada uno recupere las páginas que este nodo tenía en M
 void node_leave_cluster(void) {
     stopping = 1;
     if (hb_started) pthread_join(hb_thread, NULL);
@@ -348,6 +392,7 @@ void node_leave_cluster(void) {
 
 /* ----- inicio y liberación ----- */
 
+// Arma la tabla de nodos desde la configuración; solo este nodo empieza en línea
 int node_init(const dsm_config_t *c, uint16_t self_id) {
     cfg = *c;
     self = self_id;

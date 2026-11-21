@@ -1,5 +1,6 @@
-// Red del DSM: sockets TCP, formato de los mensajes, hilo listener, colas de trabajo
-// con sus hilos (workers y servicio de coherencia) y solicitudes que esperan respuesta.
+// Red del DSM: sockets TCP, formato de los mensajes, hilo listener, colas de trabajo con sus
+// hilos (workers y servicio de coherencia) y solicitudes que esperan respuesta.
+#define _GNU_SOURCE   // sem_clockwait, accept4
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -17,12 +18,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "alloc.h"
 #include "coherence.h"
 #include "config.h"
 #include "network.h"
 #include "node.h"
 #include "pager.h"
+#include "stats.h"
 
+// 2 sockets de escucha (datos y heartbeat) más hasta 4 conexiones entrantes por nodo
 enum { LISTENERS = 2, MAX_CONNS = LISTENERS + 4 * DSM_MAX_NODES };
 
 static dsm_config_t cfg;
@@ -36,9 +40,9 @@ static int n_conns;
 
 static pending_req_t *pending;      // max_pending solicitudes en espera de respuesta
 static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
-static atomic_uint last_req_id;
+static atomic_uint last_req_id;     // último req_id usado; cada solicitud toma el siguiente
 
-static work_queue_t q_request;      // PAGE_REQUEST, JOIN, LEAVE: pueden esperar a otros nodos
+static work_queue_t q_request;      // PAGE_REQUEST, JOIN, LEAVE, alloc, consultas: pueden esperar a otros nodos
 static work_queue_t q_service;      // INVALIDATE, OWNER_FETCH, PAGE_ACK: nunca esperan la red
 
 static pthread_t listener_thread, worker_threads[UINT8_MAX], service_threads[UINT8_MAX];
@@ -54,6 +58,7 @@ uint16_t net_get16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
 uint32_t net_get32(const uint8_t *p) { return (uint32_t)net_get16(p) << 16 | net_get16(p + 2); }
 uint64_t net_get64(const uint8_t *p) { return (uint64_t)net_get32(p) << 32 | net_get32(p + 4); }
 
+// Escribe el encabezado en los DSM_HEADER_LEN bytes que viajan por la red
 static void encode_header(const msg_header_t *h, uint8_t *b) {
     net_put32(b, h->dsm_id);
     b[4] = h->version;
@@ -70,6 +75,7 @@ static void encode_header(const msg_header_t *h, uint8_t *b) {
     net_put32(b + 28, h->aux);
 }
 
+// Inverso de encode_header
 static void decode_header(const uint8_t *b, msg_header_t *h) {
     h->dsm_id      = net_get32(b);
     h->version     = b[4];
@@ -86,7 +92,8 @@ static void decode_header(const uint8_t *b, msg_header_t *h) {
     h->aux         = net_get32(b + 28);
 }
 
-// No se confía en lo que llega: un mensaje inválido cierra la conexión
+// Valida el encabezado recibido: protocolo, tipo, origen, destino y tamaños. No se confía en
+// lo que llega por la red; un mensaje inválido cierra la conexión.
 static int valid_header(const msg_header_t *h) {
     if (h->dsm_id != DSM_PROTOCOL_ID || h->version != DSM_PROTOCOL_VERSION) return 0;
     if (h->type == 0 || h->type >= MSG_TYPE_COUNT) return 0;
@@ -97,6 +104,7 @@ static int valid_header(const msg_header_t *h) {
 
 /* ----- envío y recepción completos: TCP es un flujo de bytes, no de mensajes ----- */
 
+// Envía len bytes completos. -1 si la conexión falló.
 static int send_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
     while (len > 0) {
@@ -109,6 +117,7 @@ static int send_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
+// Recibe len bytes completos. -1 si la conexión se cerró o falló.
 static int recv_all(int fd, void *buf, size_t len) {
     char *p = buf;
     while (len > 0) {
@@ -121,6 +130,8 @@ static int recv_all(int fd, void *buf, size_t len) {
     return 0;
 }
 
+// Lee y descarta len bytes: la carga de un mensaje que nadie espera. Sin esto, esos bytes se
+// leerían como si fueran el encabezado del mensaje siguiente.
 static int discard(int fd, uint32_t len) {
     char tmp[4096];
     while (len > 0) {
@@ -131,7 +142,10 @@ static int discard(int fd, uint32_t len) {
     return 0;
 }
 
+// Envía encabezado y carga por el socket fd y cuenta el mensaje en las métricas
 int net_send_fd(int fd, const msg_header_t *h, const void *payload) {
+    atomic_fetch_add(&dsm_counters.msgs_sent, 1);
+    atomic_fetch_add(&dsm_counters.bytes_sent, DSM_HEADER_LEN + h->payload_len);
     uint8_t raw[DSM_HEADER_LEN];
     encode_header(h, raw);
     if (send_all(fd, raw, sizeof raw)) return -1;
@@ -139,14 +153,16 @@ int net_send_fd(int fd, const msg_header_t *h, const void *payload) {
     return 0;
 }
 
+// Opciones de cada conexión: sin retraso de Nagle y con límite de espera al enviar y recibir
 static void set_socket_options(int fd) {
     int on = 1;
     struct timeval tv = { cfg.request_timeout_ms / 1000, (cfg.request_timeout_ms % 1000) * 1000 };
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);    // mensajes cortos sin demora
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);    // envía los mensajes cortos al instante
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);     // un nodo trabado no bloquea
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);     // para siempre a este
 }
 
+// Abre una conexión TCP a host:port esperando a lo sumo timeout_ms. Devuelve el socket o -1.
 int net_connect(const char *host, uint16_t port, int timeout_ms) {
     char service[8];
     struct addrinfo hints, *res;
@@ -161,7 +177,8 @@ int net_connect(const char *host, uint16_t port, int timeout_ms) {
         freeaddrinfo(res);
         return -1;
     }
-    // connect sin bloqueo para poder limitar la espera con poll
+    // connect normal puede esperar más de un minuto a un equipo apagado. En modo no bloqueante
+    // retorna EINPROGRESS al instante y poll limita la espera a timeout_ms.
     int fl = fcntl(fd, F_GETFL);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     int rc = connect(fd, res->ai_addr, res->ai_addrlen);
@@ -183,6 +200,30 @@ int net_connect(const char *host, uint16_t port, int timeout_ms) {
     return fd;
 }
 
+// 1 si este equipo puede escuchar en host:port (la IP es suya y el puerto está libre).
+// dsm_init la usa para elegir solo qué línea node de la configuración le corresponde.
+int net_can_listen(const char *host, uint16_t port) {
+    char service[8];
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(service, sizeof service, "%u", port);
+    if (getaddrinfo(host, service, &hints, &res)) return 0;
+
+    int on = 1, ok = 0;
+    int fd = socket(res->ai_family, res->ai_socktype | SOCK_CLOEXEC, res->ai_protocol);
+    if (fd >= 0) {
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+        // bind falla si la dirección no es de este equipo o si otro proceso ya escucha ahí
+        ok = bind(fd, res->ai_addr, res->ai_addrlen) == 0 && listen(fd, 1) == 0;
+        close(fd);
+    }
+    freeaddrinfo(res);
+    return ok;
+}
+
+// Abre un socket que escucha en el puerto, en todas las interfaces del equipo
 static int open_listener(uint16_t port) {
     int on = 1;
     struct sockaddr_in addr;
@@ -205,6 +246,7 @@ static int open_listener(uint16_t port) {
 
 /* ----- colas de trabajo (productor-consumidor) ----- */
 
+// Crea una cola con cap solicitudes y ready_cap páginas listas
 static int queue_init(work_queue_t *q, uint32_t cap, uint32_t ready_cap) {
     memset(q, 0, sizeof *q);
     q->ring = calloc(cap, sizeof *q->ring);
@@ -229,7 +271,8 @@ static void queue_destroy(work_queue_t *q) {
     memset(q, 0, sizeof *q);
 }
 
-// La llama el listener: si no hay hueco no espera, descarta la solicitud
+// Mete una solicitud en la cola. Si está llena no espera: descarta la solicitud, porque el
+// listener no se puede bloquear (dejaría de leer todos los sockets).
 static void queue_push(work_queue_t *q, const work_item_t *item) {
     if (sem_trywait(&q->free_slots)) {
         dsm_log(LOG_ERROR, "cola de trabajo llena: se descarta un mensaje del nodo %u", item->from_node);
@@ -250,7 +293,7 @@ static int queue_pop(work_queue_t *q, work_item_t *item, uint32_t *page) {
 
     int is_page = 0;
     pthread_mutex_lock(&q->lock);
-    if (q->ready_len > 0) {   // primero los traspasos: su página sigue ocupada
+    if (q->ready_len > 0) {   // primero las páginas listas: siguen con busy tomado y bloquean a otros
         *page = q->ready_pages[q->ready_head];
         q->ready_head = (q->ready_head + 1) % q->ready_cap;
         q->ready_len--;
@@ -265,6 +308,7 @@ static int queue_pop(work_queue_t *q, work_item_t *item, uint32_t *page) {
     return is_page;
 }
 
+// Avisa que la página tiene la siguiente solicitud lista para atender (ver release_busy)
 void net_push_ready(uint32_t page) {
     pthread_mutex_lock(&q_request.lock);
     q_request.ready_pages[(q_request.ready_head + q_request.ready_len) % q_request.ready_cap] = page;
@@ -273,6 +317,7 @@ void net_push_ready(uint32_t page) {
     sem_post(&q_request.items);
 }
 
+// Encola una orden local de unirse a dst; la ejecuta un worker, no el hilo que la pide
 void net_push_join(uint16_t dst) {
     work_item_t item;
     memset(&item, 0, sizeof item);
@@ -283,6 +328,19 @@ void net_push_join(uint16_t dst) {
     queue_push(&q_request, &item);
 }
 
+// Encola una orden local de liberar las asignaciones sin nombre que hizo node (salió o cayó)
+void net_push_release(uint16_t node) {
+    work_item_t item;
+    memset(&item, 0, sizeof item);
+    item.header.type = MSG_ALLOC_RELEASE;
+    item.header.src = self;   // orden local: liberar lo que asignó node
+    item.header.aux = node;
+    item.from_node = self;
+    queue_push(&q_request, &item);
+}
+
+// Hilo worker: saca trabajo de su cola y lo pasa al módulo según el tipo de mensaje.
+// Los tipos están numerados por grupo, por eso alcanza con comparar con el primero de cada uno.
 static void *worker(void *arg) {
     work_queue_t *q = arg;
     work_item_t item;
@@ -292,6 +350,8 @@ static void *worker(void *arg) {
         if (kind < 0) break;
         if (kind == 1) coherence_serve_ready(page);
         else if (item.header.type == MSG_JOIN || item.header.type == MSG_LEAVE) node_handle(&item);
+        else if (item.header.type >= MSG_STATS_REQUEST) stats_handle(&item);
+        else if (item.header.type >= MSG_ALLOC_MAP) alloc_handle(&item);
         else coherence_handle(&item);
     }
     return NULL;
@@ -299,6 +359,7 @@ static void *worker(void *arg) {
 
 /* ----- solicitudes pendientes: enlazan cada respuesta con quien la espera ----- */
 
+// Hora actual + ms, en el reloj monotónico (no cambia si alguien ajusta la hora del sistema)
 static struct timespec time_after_ms(uint32_t ms) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -344,6 +405,9 @@ static int deliver_reply(const msg_header_t *h, int fd, const void *payload) {
     return rc;
 }
 
+// Envía una solicitud a dst y bloquea hasta la respuesta o hasta agotar las esperas.
+// La carga de la respuesta queda en buf; en h quedan req_id, payload_len y aux de la respuesta.
+// Devuelve el status de la respuesta, ERR_TIMEOUT, ERR_NODE_DOWN o ERR_BUSY.
 int net_request(uint16_t dst, msg_header_t *h, const void *payload, void *buf, uint32_t buf_len) {
     pending_req_t *p = NULL;
     pthread_mutex_lock(&pending_lock);
@@ -370,14 +434,16 @@ int net_request(uint16_t dst, msg_header_t *h, const void *payload, void *buf, u
     h->flags &= (uint16_t)~FLAG_IS_REPLY;
     int answered = 0;
     if (node_send(dst, h, payload) == 0) {
-        // TCP no pierde mensajes: un "reintento" es seguir esperando, sin reenviar
-        for (int attempt = 0; attempt <= cfg.request_retries && !answered; attempt++) {
+        // TCP no pierde mensajes: un "reintento" es seguir esperando, sin reenviar.
+        // La unión espera una sola vez: el hilo de heartbeat la reintenta después.
+        int waits = h->type == MSG_JOIN ? 1 : cfg.request_retries + 1;
+        for (int attempt = 0; attempt < waits && !answered; attempt++) {
             struct timespec until = time_after_ms(cfg.request_timeout_ms);
             int rc;
             do rc = sem_clockwait(&p->done, CLOCK_MONOTONIC, &until); while (rc && errno == EINTR);
             if (rc == 0) answered = 1;
             else dsm_log(LOG_WARN, "sin respuesta del nodo %u al mensaje %u (página %u), espera %d de %d",
-                         dst, h->type, h->page, attempt + 1, cfg.request_retries + 1);
+                         dst, h->type, h->page, attempt + 1, waits);
         }
     } else {
         pthread_mutex_lock(&pending_lock);
@@ -387,18 +453,25 @@ int net_request(uint16_t dst, msg_header_t *h, const void *payload, void *buf, u
     }
 
     pthread_mutex_lock(&pending_lock);
-    if (!answered && p->state != REQ_SENT) {   // la respuesta llegó justo al vencer la espera
+    // La respuesta llegó justo al vencer la espera y el listener la está copiando: hay que
+    // esperar a que termine, porque está escribiendo en buf
+    if (!answered && p->state != REQ_SENT) {
         pthread_mutex_unlock(&pending_lock);
         while (sem_wait(&p->done) && errno == EINTR) { }
         pthread_mutex_lock(&pending_lock);
         answered = 1;
     }
     int status = answered ? p->status : ERR_TIMEOUT;
+    if (answered) {   // largo de la carga y argumento de la respuesta, para quien los necesite
+        h->payload_len = p->recv_len;
+        h->aux = p->aux;
+    }
     p->in_use = 0;
     pthread_mutex_unlock(&pending_lock);
     return status;
 }
 
+// Despierta con ERR_NODE_DOWN a todos los que esperan respuesta de peer (que cayó)
 void net_fail_pending(uint16_t peer) {
     pthread_mutex_lock(&pending_lock);
     for (uint16_t i = 0; i < cfg.max_pending; i++) {
@@ -413,14 +486,19 @@ void net_fail_pending(uint16_t peer) {
 
 /* ----- reparto de los mensajes recibidos ----- */
 
+// Cola que atiende cada tipo de solicitud; NULL si el tipo solo existe como respuesta
 static work_queue_t *queue_for(uint8_t type) {
     switch (type) {
         case MSG_JOIN: case MSG_LEAVE: case MSG_PAGE_REQUEST: return &q_request;
+        case MSG_ALLOC_MAP: case MSG_ALLOC_RESERVE: case MSG_ALLOC_RELEASE: case MSG_NAME_LOOKUP:
+        case MSG_STATS_REQUEST: case MSG_PAGETABLE_REQUEST: case MSG_ALLOCS_REQUEST:
+            return &q_request;
         case MSG_PAGE_ACK: case MSG_OWNER_FETCH: case MSG_INVALIDATE: return &q_service;
         default: return NULL;   // los demás tipos solo existen como respuesta
     }
 }
 
+// Entrega un mensaje de este nodo a sí mismo, sin socket: lo mismo que haría el listener
 void net_deliver(const msg_header_t *h, const void *payload) {
     if (h->flags & FLAG_IS_REPLY) {
         deliver_reply(h, -1, payload);
@@ -438,6 +516,7 @@ void net_deliver(const msg_header_t *h, const void *payload) {
 
 /* ----- hilo listener: lee todas las conexiones entrantes; nunca envía ----- */
 
+// Acepta una conexión entrante y la agrega a las que vigila poll
 static void accept_conn(int listen_fd) {
     int fd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
     if (fd < 0) return;
@@ -468,18 +547,22 @@ static int read_message(int i) {
         return -1;
     }
     conn_node[i] = h.src;
+    atomic_fetch_add(&dsm_counters.msgs_received, 1);
+    atomic_fetch_add(&dsm_counters.bytes_received, DSM_HEADER_LEN + h.payload_len);
 
     // Solo la unión puede venir de un nodo que aún no está en línea
     int joining = h.type == MSG_JOIN || h.type == MSG_JOIN_ACK;
     if (!joining && !node_is_online(h.src)) {
+        dsm_log(LOG_DEBUG, "mensaje tipo %u del nodo %u, que aquí no está en línea: se cierra su conexión",
+                h.type, h.src);
         conn_node[i] = -1;
         return -1;
     }
-    if (!joining) node_seen(h.src);
+    if (!joining) node_seen(h.src);   // cualquier mensaje cuenta como señal de vida
 
     if (h.flags & FLAG_IS_REPLY) return deliver_reply(&h, fd, NULL);
 
-    if (h.type == MSG_HEARTBEAT) {
+    if (h.type == MSG_HEARTBEAT) {   // el listener lo atiende directo: es corto y no responde
         uint8_t hb[DSM_HB_PAYLOAD_LEN];
         if (h.payload_len != sizeof hb || recv_all(fd, hb, sizeof hb)) return -1;
         node_heartbeat(h.src, net_get32(hb));
@@ -500,6 +583,7 @@ static int read_message(int i) {
     return 0;
 }
 
+// Hilo listener: un solo hilo vigila todos los sockets con poll y lee lo que llegue.
 static void *listener(void *arg) {
     (void)arg;
     while (!stopping) {
@@ -525,6 +609,8 @@ static void *listener(void *arg) {
 
 /* ----- inicio y liberación ----- */
 
+// Detiene los hilos y cierra todo. Los sem_post despiertan a los workers dormidos para que
+// vean stopping y terminen.
 void net_shutdown(void) {
     stopping = 1;
     for (int i = 0; i < n_workers; i++) sem_post(&q_request.items);
@@ -545,6 +631,7 @@ void net_shutdown(void) {
     stopping = 0;
 }
 
+// Abre los puertos de datos y heartbeat del nodo, crea las colas y arranca los hilos
 int net_init(const dsm_config_t *c, uint16_t self_id) {
     cfg = *c;
     self = self_id;

@@ -36,7 +36,7 @@ static void set_defaults(dsm_config_t *c) {
     c->hb_interval_ms = 1000; c->hb_timeout_ms = 3500;
     c->request_timeout_ms = 2000; c->request_retries = 3;
     c->max_payload = 65536;
-    c->port_min = 27100; c->port_max = 27199;
+    c->port_min = 27900; c->port_max = 27999;
     c->max_threads = 64; c->max_pending = 128;
     c->fault_threads = 2; c->service_threads = 2; c->protocol_workers = 4;
     c->log_level = LOG_INFO;
@@ -323,6 +323,7 @@ void dsm_log_setup(uint8_t level, uint16_t node) {
     log_node  = node;
 }
 
+// Escribe en stderr un mensaje con el nivel y el nodo, si el nivel está habilitado
 void dsm_log(int level, const char* fmt, ...) {
     static const char* names[] = { "error", "warn", "info", "debug" };
     if (level > log_level) return;

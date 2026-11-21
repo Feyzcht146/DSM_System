@@ -3,3 +3,4 @@ Informe_tecnico/
 */*.o
 dsm_system
 tests/
+libdsm.a

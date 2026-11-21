@@ -1,3 +1,4 @@
+// Interfaz de los nodos (node.c): tabla de nodos, envío, unión, salida y heartbeat
 #ifndef NODE_H
 #define NODE_H
 
@@ -19,6 +20,7 @@ void node_leave_cluster(void);
 int node_send(uint16_t dst, const msg_header_t *h, const void *payload);
 
 uint16_t node_self(void);
+uint64_t node_uptime_ms(void);                         // desde que este nodo se unió
 int  node_is_online(uint16_t id);
 void node_seen(uint16_t id);                           // llegó un mensaje de id
 void node_heartbeat(uint16_t id, uint32_t free_pages); // llegó un latido de id

@@ -1,3 +1,4 @@
+// Interfaz de la configuración (config.c): carga de dsm.conf y registro de eventos
 #ifndef CONFIG_H
 #define CONFIG_H
 
